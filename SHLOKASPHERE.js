@@ -57,9 +57,30 @@ async function sendMessageToFirestore(messageObj) {
 }
 
 // --- API Service Setup ---
-// For Vercel deployment, API calls are made to relative paths that point to Serverless Functions.
+
+// Simple session cache to avoid re-analyzing the same text, improving performance and reducing API costs.
+const apiCache = {
+  get: (key) => {
+    try {
+      const item = sessionStorage.getItem(key);
+      return item ? JSON.parse(item) : null;
+    } catch (error) {
+      return null;
+    }
+  },
+  set: (key, value) => {
+    try {
+      sessionStorage.setItem(key, JSON.stringify(value));
+    } catch (error) {
+      // Cache is non-critical, so we can ignore storage errors (e.g., quota exceeded)
+    }
+  }
+};
 
 const analyzeSentiment = async (text) => {
+  const cacheKey = `sentiment:${text}`;
+  const cached = apiCache.get(cacheKey);
+  if (cached) return cached;
   try {
     const response = await fetch(`/api/google-sentiment`, {
       method: "POST",
@@ -68,6 +89,7 @@ const analyzeSentiment = async (text) => {
     });
     if (!response.ok) throw new Error("Sentiment API error");
     const data = await response.json();
+    apiCache.set(cacheKey, data);
     return data;
   } catch (err) {
     console.error("Sentiment API call failed:", err);
@@ -76,6 +98,9 @@ const analyzeSentiment = async (text) => {
 };
 
 const analyzeEntities = async (text) => {
+  const cacheKey = `entities:${text}`;
+  const cached = apiCache.get(cacheKey);
+  if (cached) return cached;
   try {
     const response = await fetch(`/api/google-entities`, {
       method: "POST",
@@ -84,7 +109,9 @@ const analyzeEntities = async (text) => {
     });
     if (!response.ok) throw new Error("Entity API error");
     const data = await response.json();
-    return data.entities;
+    const entities = data.entities || [];
+    apiCache.set(cacheKey, entities);
+    return entities;
   } catch (err) {
     console.error("Entity API call failed:", err);
     return [];
@@ -92,6 +119,9 @@ const analyzeEntities = async (text) => {
 };
 
 const translateText = async (text, target) => {
+  const cacheKey = `translate:${target}:${text}`;
+  const cached = apiCache.get(cacheKey);
+  if (cached) return cached;
   try {
     const response = await fetch(`/api/google-translate`, {
       method: "POST",
@@ -100,19 +130,21 @@ const translateText = async (text, target) => {
     });
     if (!response.ok) throw new Error("Translation API error");
     const data = await response.json();
-    return data.translation;
+    const translation = data.translation || "";
+    apiCache.set(cacheKey, translation);
+    return translation;
   } catch (err) {
     console.error("Translation API call failed:", err);
     return "";
   }
 };
 
-const getAIResponse = async (message, history) => {
+const getAIResponse = async (message, history, language) => {
   try {
     const response = await fetch(`/api/generate-response`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ message, history }),
+      body: JSON.stringify({ message, history, language }),
     });
     if (!response.ok) throw new Error("AI response API error");
     const data = await response.json();
@@ -123,23 +155,112 @@ const getAIResponse = async (message, history) => {
   }
 };
 
+/**
+ * A centralized utility to perform all AI analyses on a message and update it in Firestore.
+ * @param {import('firebase/firestore').DocumentReference} docRef - The Firestore document reference for the message.
+ * @param {string} text - The text of the message to analyze.
+ * @param {string} targetLang - The language code to translate the text into.
+ * @returns {Promise<boolean>} - A promise that resolves to true on success and false on failure.
+ */
+async function analyzeAndSaveMessageFeatures(docRef, text, targetLang) {
+  try {
+    const [sentiment, entities, translation] = await Promise.all([
+      analyzeSentiment(text),
+      analyzeEntities(text),
+      translateText(text, targetLang)
+    ]);
+    await updateDoc(docRef, { ...(sentiment && { sentiment }), ...(entities && { entities }), ...(translation && { translation }) });
+    return true;
+  } catch (e) {
+    console.error("Failed to update message with analysis:", e);
+    return false;
+  }
+}
+
+// --- Language (i18n) Management ---
+const translations = {
+  en: {
+    // App
+    appName: "SHLOKASPHERE",
+    loadingApp: "Loading Application...",
+    loggedInAs: "Logged in as:",
+    signOut: "Sign out",
+    welcomeTitle: "Welcome to the AI-Powered Chat Experience",
+    welcomeSubtitle: "Sign in to begin your conversation.",
+    signInWithGoogle: "Sign in with Google",
+    // Chat
+    loadMore: "Load More",
+    loadingMore: "Loading...",
+    loadingMessages: "Loading messages...",
+    messagePlaceholder: "Type your message...",
+    send: "Send",
+    // Analytics
+    analyticsDashboard: "Analytics Dashboard",
+    totalMessages: "Total Messages:",
+    uniqueUsers: "Unique Users:",
+    // Message Item
+    translationLabel: "Translation:",
+  },
+  hi: {
+    // App
+    appName: "श्लोकस्फेयर",
+    loadingApp: "एप्लिकेशन लोड हो रहा है...",
+    loggedInAs: "के रूप में लॉग इन:",
+    signOut: "साइन आउट",
+    welcomeTitle: "एआई-संचालित चैट अनुभव में आपका स्वागत है",
+    welcomeSubtitle: "अपनी बातचीत शुरू करने के लिए साइन इन करें।",
+    signInWithGoogle: "Google से साइन इन करें",
+    // Chat
+    loadMore: "और लोड करें",
+    loadingMore: "लोड हो रहा है...",
+    loadingMessages: "संदेश लोड हो रहे हैं...",
+    messagePlaceholder: "अपना संदेश लिखें...",
+    send: "भेजें",
+    // Analytics
+    analyticsDashboard: "विश्लेषिकी डैशबोर्ड",
+    totalMessages: "कुल संदेश:",
+    uniqueUsers: "अद्वितीय उपयोगकर्ता:",
+    // Message Item
+    translationLabel: "अनुवाद:",
+  }
+};
+
+const LanguageContext = createContext();
+
+const useTranslation = () => {
+  const { language } = useContext(LanguageContext);
+  return (key) => translations[language][key] || key;
+};
+
 // --- Theme Management ---
 const ThemeContext = createContext();
 
 function ThemeProvider({ children }) {
   const [theme, setTheme] = useState(() => {
-    const savedTheme = localStorage.getItem('theme');
-    return savedTheme || 'light';
+    try {
+      const savedTheme = localStorage.getItem('theme');
+      if (savedTheme === 'light' || savedTheme === 'dark') {
+        return savedTheme;
+      }
+    } catch (error) {
+      console.warn("localStorage is not available. Using default theme.");
+    }
+    return 'light';
   });
 
   useEffect(() => {
     const root = window.document.documentElement;
+    root.lang = document.documentElement.lang; // Sync with language
     if (theme === 'dark') {
       root.classList.add('dark');
     } else {
       root.classList.remove('dark');
     }
-    localStorage.setItem('theme', theme);
+    try {
+      localStorage.setItem('theme', theme);
+    } catch (error) {
+      console.warn("localStorage is not available. Theme will not be persisted.");
+    }
   }, [theme]);
 
   const toggleTheme = () => {
@@ -150,6 +271,37 @@ function ThemeProvider({ children }) {
     <ThemeContext.Provider value={{ theme, toggleTheme }}>
       {children}
     </ThemeContext.Provider>
+  );
+}
+
+function LanguageProvider({ children }) {
+  const [language, setLanguage] = useState(() => {
+    try {
+      const savedLang = localStorage.getItem('language');
+      if (savedLang === 'en' || savedLang === 'hi') {
+        return savedLang;
+      }
+    } catch (error) {
+      console.warn("localStorage is not available. Using default language.");
+    }
+    return 'en'; // Default language
+  });
+
+  useEffect(() => {
+    document.documentElement.lang = language;
+    try {
+      localStorage.setItem('language', language);
+    } catch (error) {
+      console.warn("localStorage is not available. Language will not be persisted.");
+    }
+  }, [language]);
+
+  const value = { language, setLanguage };
+
+  return (
+    <LanguageContext.Provider value={value}>
+      {children}
+    </LanguageContext.Provider>
   );
 }
 
@@ -168,6 +320,49 @@ function useAuth() {
   }, []);
 
   return { user, loading };
+}
+
+function useMessageAnalysis() {
+  const [analyzingIds, setAnalyzingIds] = useState(new Set());
+
+  const { language } = useContext(LanguageContext);
+  const langRef = useRef(language);
+
+  useEffect(() => {
+    langRef.current = language;
+  }, [language]);
+
+  const performMessageAnalysis = useCallback(async (messageId, text) => {
+    if (!messageId || !text) return;
+    if (messageId.startsWith('temp_')) {
+      toast.error("Please wait for the message to be saved before analyzing.");
+      return;
+    }
+
+    setAnalyzingIds(prev => new Set(prev).add(messageId)); // Use functional update
+    toast.loading('Analyzing message...', { id: `analyzing-${messageId}` });
+
+    try {
+      const messageRef = doc(db, "messages", messageId);
+      const success = await analyzeAndSaveMessageFeatures(messageRef, text, langRef.current);
+      if (success) {
+        toast.success('Analysis complete!', { id: `analyzing-${messageId}` });
+      } else {
+        toast.error('Analysis failed.', { id: `analyzing-${messageId}` });
+      }
+    } catch (error) {
+      console.error("Failed to re-analyze message:", error);
+      toast.error('Analysis failed.', { id: `analyzing-${messageId}` });
+    } finally {
+      setAnalyzingIds(prev => {
+        const newSet = new Set(prev);
+        newSet.delete(messageId);
+        return newSet;
+      });
+    }
+  }, []); // The function is now stable and doesn't depend on language state
+
+  return { performMessageAnalysis, analyzingIds };
 }
 
 const generateId = () => `temp_${Math.random().toString(36).substr(2, 9)}`;
@@ -254,6 +449,7 @@ function messagesReducer(state, action) {
 function useMessages(user) {
   const [state, dispatch] = useReducer(messagesReducer, messagesInitialState);
   const { messages, lastDoc, hasMore, isLoadingMore } = state;
+  const { language } = useContext(LanguageContext);
 
   const sessionStartRef = useRef(new Date());
   const messagesRef = useRef(messages);
@@ -287,7 +483,8 @@ function useMessages(user) {
         console.error("Error loading initial messages:", error);
         toast.error("Could not load chat history.");
       } finally {
-        if (isMounted) {
+        // Ensure we don't try to update state on an unmounted component.
+        if (isMounted) { 
           dispatch({ type: actionTypes.SET_LOADING, payload: false });
         }
       }
@@ -335,31 +532,6 @@ function useMessages(user) {
     }
   }, [lastDoc, hasMore, isLoadingMore]);
 
-  const performMessageAnalysis = useCallback(async (messageId, text) => {
-    if (!messageId || !text) return;
-    if (messageId.startsWith('temp_')) {
-      toast.error("Please wait for the message to be saved before analyzing.");
-      return;
-    }
-
-    toast.loading('Analyzing message...', { id: `analyzing-${messageId}` });
-
-    try {
-      const [sentiment, entities, translation] = await Promise.all([
-        analyzeSentiment(text),
-        analyzeEntities(text),
-        translateText(text, 'hi')
-      ]);
-
-      const messageRef = doc(db, "messages", messageId);
-      await updateDoc(messageRef, { ...(sentiment && { sentiment }), ...(entities && { entities }), ...(translation && { translation }) });
-      toast.success('Analysis complete!', { id: `analyzing-${messageId}` });
-    } catch (error) {
-      console.error("Failed to re-analyze message:", error);
-      toast.error('Analysis failed.', { id: `analyzing-${messageId}` });
-    }
-  }, []);
-
   const sendMessage = useCallback(async (messageText) => {
     if (moderateContent(messageText)) {
       toast.error('Inappropriate content detected.');
@@ -388,25 +560,10 @@ function useMessages(user) {
       return;
     }
 
-    const performAnalysis = async () => {
-      const [sentiment, entities, translation] = await Promise.all([
-        analyzeSentiment(messageText),
-        analyzeEntities(messageText),
-        translateText(messageText, 'hi')
-      ]);
-      if (docRef) {
-        try {
-            await updateDoc(docRef, { ...(sentiment && { sentiment }), ...(entities && { entities }), ...(translation && { translation }) });
-        } catch (e) {
-            console.error("Failed to update message with analysis:", e);
-        }
-      }
-    };
-
     const fetchAIResponse = async () => {
       try {
         const currentHistory = [...messagesRef.current, optimisticMessage];
-        const responseText = await getAIResponse(messageText, currentHistory);
+        const responseText = await getAIResponse(messageText, currentHistory, language);
         const aiMessage = { user: user.email, text: responseText, sender: 'ai', timestamp: serverTimestamp(), tokens: responseText.split(/\s+/).length };
         await sendMessageToFirestore(aiMessage);
       } catch (error) {
@@ -420,12 +577,13 @@ function useMessages(user) {
       }
     };
 
-    performAnalysis();
+    // Call the centralized analysis function and the AI response function
+    analyzeAndSaveMessageFeatures(docRef, messageText, language);
     fetchAIResponse();
 
-  }, [user]);
+  }, [user, language]);
 
-  return { ...state, loadMore, sendMessage, performMessageAnalysis };
+  return { ...state, loadMore, sendMessage };
 }
 
 // --- UI Components ---
@@ -433,6 +591,10 @@ function useMessages(user) {
 function AITypingIndicator() {
   return (
     <div className="flex my-2 gap-4 justify-start">
+      {/* This visually hidden element makes the typing indicator accessible to screen readers. */}
+      <div role="status" className="sr-only">
+        AI is typing...
+      </div>
       <div className="p-4 rounded-2xl shadow-md bg-gray-100 dark:bg-gray-600">
         <div className="flex items-center gap-2 text-gray-500 dark:text-gray-400">
           <span className="h-2 w-2 bg-gray-400 dark:bg-gray-500 rounded-full animate-bounce [animation-delay:-0.3s]"></span>
@@ -487,6 +649,24 @@ const ThemeToggleButton = () => {
   );
 };
 
+const LanguageSelector = () => {
+  const { language, setLanguage } = useContext(LanguageContext);
+
+  return (
+    <div className="relative">
+      <select
+        value={language}
+        onChange={(e) => setLanguage(e.target.value)}
+        className="p-2 rounded-full appearance-none bg-transparent text-gray-600 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700 cursor-pointer focus:outline-none"
+        aria-label="Select language"
+      >
+        <option value="en">🇺🇸 English</option>
+        <option value="hi">🇮🇳 हिन्दी</option>
+      </select>
+    </div>
+  );
+};
+
 const Avatar = ({ sender, userEmail }) => {
   const isUser = sender === 'user';
   // Robustly get the first letter of the email, or 'U' as a fallback.
@@ -499,8 +679,12 @@ const Avatar = ({ sender, userEmail }) => {
   return <img src={avatarSrc} alt={`${sender} avatar`} className="h-8 w-8 rounded-full shadow-md flex-shrink-0" />;
 };
 
-const MessageItem = memo(function MessageItem({ message, performMessageAnalysis }) {
+const MessageItem = memo(function MessageItem({ message, performMessageAnalysis, analyzingIds }) {
+  const t = useTranslation();
   const isUser = message.sender === 'user';
+  // Check if the message has already been successfully analyzed.
+  const isAnalyzed = !!(message.sentiment && message.entities && message.entities.length > 0);
+  const isAnalyzing = analyzingIds.has(message.id);
 
   const handleCopy = () => {
     if (!navigator.clipboard) {
@@ -513,7 +697,7 @@ const MessageItem = memo(function MessageItem({ message, performMessageAnalysis 
   };
 
   const handleAnalyze = () => {
-    if (isUser) {
+    if (isUser && !isAnalyzed && !isAnalyzing) {
       performMessageAnalysis(message.id, message.text);
     }
   };
@@ -526,11 +710,17 @@ const MessageItem = memo(function MessageItem({ message, performMessageAnalysis 
       <Avatar sender={message.sender} userEmail={message.user} />
 
       <div className={`flex items-center gap-1 p-1 rounded-full bg-white dark:bg-gray-700 border dark:border-gray-600 shadow-md opacity-0 group-hover:opacity-100 transition-opacity z-10 ${isUser ? 'mr-1' : 'ml-1'}`}>
-        <button onClick={handleCopy} title="Copy text" className="p-1.5 rounded-full hover:bg-gray-100 dark:hover:bg-gray-600 text-gray-600 dark:text-gray-300">
+        <button onClick={handleCopy} title="Copy text" aria-label="Copy message text" className="p-1.5 rounded-full hover:bg-gray-100 dark:hover:bg-gray-600 text-gray-600 dark:text-gray-300">
           <CopyIcon />
         </button>
         {isUser && (
-          <button onClick={handleAnalyze} title="Re-run analysis" className="p-1.5 rounded-full hover:bg-gray-100 dark:hover:bg-gray-600 text-gray-600 dark:text-gray-300">
+          <button
+            onClick={handleAnalyze}
+            title={isAnalyzed ? "Analysis complete" : (isAnalyzing ? "Analyzing..." : "Re-run analysis")}
+            aria-label={isAnalyzed ? "Analysis complete" : (isAnalyzing ? "Analyzing message" : "Re-run analysis on message")}
+            className="p-1.5 rounded-full hover:bg-gray-100 dark:hover:bg-gray-600 text-gray-600 dark:text-gray-300 disabled:text-gray-300 dark:disabled:text-gray-500 disabled:cursor-not-allowed"
+            disabled={isAnalyzed || isAnalyzing}
+          >
             <AnalyzeIcon />
           </button>
         )}
@@ -563,7 +753,7 @@ const MessageItem = memo(function MessageItem({ message, performMessageAnalysis 
         )}
         {message.translation && (
           <div className="mt-2 text-xs">
-            <span className="border border-indigo-300 dark:border-indigo-700 rounded-md px-2 py-0.5 bg-indigo-50 dark:bg-indigo-900/50 text-indigo-800 dark:text-indigo-300">Translation: {message.translation}</span>
+            <span className="border border-indigo-300 dark:border-indigo-700 rounded-md px-2 py-0.5 bg-indigo-50 dark:bg-indigo-900/50 text-indigo-800 dark:text-indigo-300">{t('translationLabel')} {message.translation}</span>
           </div>
         )}
       </div>
@@ -575,6 +765,7 @@ function AnalyticsDashboard() {
   const [messageCount, setMessageCount] = useState(0);
   const [userCount, setUserCount] = useState(0);
   const [loading, setLoading] = useState(true);
+  const t = useTranslation();
 
   useEffect(() => {
     const getStats = async () => {
@@ -598,15 +789,17 @@ function AnalyticsDashboard() {
 
   return (
     <div className="p-8 mt-8 bg-gray-50 dark:bg-gray-700/50 rounded-xl shadow-sm">
-      <h2 className="font-bold text-2xl text-gray-800 dark:text-gray-100">Analytics Dashboard</h2>
-      <div className="mt-4 text-lg text-gray-700 dark:text-gray-300">Total Messages: {messageCount}</div>
-      <div className="mt-2 text-lg text-gray-700 dark:text-gray-300">Unique Users: {userCount}</div>
+      <h2 className="font-bold text-2xl text-gray-800 dark:text-gray-100">{t('analyticsDashboard')}</h2>
+      <div className="mt-4 text-lg text-gray-700 dark:text-gray-300">{t('totalMessages')} {messageCount}</div>
+      <div className="mt-2 text-lg text-gray-700 dark:text-gray-300">{t('uniqueUsers')} {userCount}</div>
     </div>
   );
 }
 
 function ChatComponent({ user }) {
-  const { messages, isTyping, isLoading, hasMore, isLoadingMore, loadMore, sendMessage, performMessageAnalysis } = useMessages(user);
+  const { messages, isTyping, isLoading, hasMore, isLoadingMore, loadMore, sendMessage } = useMessages(user);
+  const { performMessageAnalysis, analyzingIds } = useMessageAnalysis();
+  const t = useTranslation();
   const [inputMessage, setInputMessage] = useState('');
   const messagesEndRef = useRef(null);
 
@@ -636,59 +829,106 @@ function ChatComponent({ user }) {
           <>
             {hasMore && (
               <div className="text-center">
-                <button onClick={loadMore} disabled={isLoadingMore} className="text-blue-500 hover:underline disabled:text-gray-400 dark:text-blue-400 dark:disabled:text-gray-500">
-                  {isLoadingMore ? "Loading..." : "Load More"}
+                <button onClick={handleLoadMore} disabled={isLoadingMore} className="text-blue-500 hover:underline disabled:text-gray-400 dark:text-blue-400 dark:disabled:text-gray-500">
+                  {isLoadingMore ? t('loadingMore') : t('loadMore')}
                 </button>
               </div>
             )}
-            {messages.map(message => <MessageItem key={message.id} message={message} performMessageAnalysis={performMessageAnalysis} />)}
+            {messages.map(message => <MessageItem key={message.id} message={message} performMessageAnalysis={performMessageAnalysis} analyzingIds={analyzingIds} />)}
           </>
         )}
         {isTyping && !isLoading && <AITypingIndicator />}
         <div ref={messagesEndRef} />
       </div>
+      {showScrollToBottom && (
+        <button
+          onClick={scrollToBottom}
+          className="absolute bottom-20 left-1/2 -translate-x-1/2 z-20 px-4 py-2 bg-blue-500 text-white rounded-full shadow-lg flex items-center gap-2 text-sm animate-bounce"
+          aria-label="Scroll to new messages"
+        >
+          <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 14l-7 7m0 0l-7-7m7 7V3" /></svg>
+          New Messages
+        </button>
+      )}
 
       <form onSubmit={handleSendMessage} className="mt-4 flex">
-        <input type="text" value={inputMessage} onChange={(e) => setInputMessage(e.target.value)} className="flex-grow p-2 border rounded-l-md bg-white dark:bg-gray-800 dark:border-gray-600 text-gray-800 dark:text-gray-100 placeholder-gray-400" aria-label="Your message" placeholder="Type your message..." disabled={isTyping || !user} />
+        <input type="text" value={inputMessage} onChange={(e) => setInputMessage(e.target.value)} className="flex-grow p-2 border rounded-l-md bg-white dark:bg-gray-800 dark:border-gray-600 text-gray-800 dark:text-gray-100 placeholder-gray-400" aria-label="Your message" placeholder={t('messagePlaceholder')} disabled={isTyping || !user} />
         <button type="submit" className="px-4 py-2 bg-blue-500 text-white rounded-r-md" disabled={isTyping || !user}>
-          Send
+          {t('send')}
         </button>
       </form>
     </div>
   );
 }
 
+// --- Error Boundary Component ---
+class ErrorBoundary extends React.Component {
+  constructor(props) {
+    super(props);
+    this.state = { hasError: false };
+  }
+
+  static getDerivedStateFromError(error) {
+    // Update state so the next render will show the fallback UI.
+    return { hasError: true };
+  }
+
+  componentDidCatch(error, errorInfo) {
+    // You can also log the error to an error reporting service
+    console.error("Uncaught error:", error, errorInfo);
+  }
+
+  render() {
+    if (this.state.hasError) {
+      return <div className="p-8 text-center text-red-500 dark:text-red-400"><h2 className="text-2xl font-bold">Something went wrong.</h2><p className="mt-2">Please try refreshing the page.</p></div>;
+    }
+
+    return this.props.children;
+  }
+}
+
 // --- Main App Component ---
 function App() {
+  return (
+    <LanguageProvider>
+      <ThemeProvider>
+        <AppContent />
+      </ThemeProvider>
+    </LanguageProvider>
+  );
+}
+
+function AppContent() {
   const { user, loading } = useAuth();
+  const t = useTranslation();
 
   if (loading) {
     return (
       <div className="min-h-screen bg-gray-100 dark:bg-gray-900 flex items-center justify-center text-gray-500 dark:text-gray-400">
-        Loading Application...
+        {t('loadingApp')}
       </div>
     );
   }
 
   return (
-    <ThemeProvider>
-      <div className="min-h-screen bg-gray-100 dark:bg-gray-900 flex flex-col items-center p-4 font-sans">
-        <Toaster position="top-center" />
-        <div className="w-full max-w-3xl bg-white dark:bg-gray-800 rounded-2xl shadow-xl p-6">
-          <h1 className="text-3xl font-bold mb-4 text-center text-gray-800 dark:text-gray-100">SHLOKASPHERE</h1>
+    <div className="min-h-screen bg-gray-100 dark:bg-gray-900 flex flex-col items-center p-4 font-sans">
+      <Toaster position="top-center" />
+      <div className="w-full max-w-3xl bg-white dark:bg-gray-800 rounded-2xl shadow-xl p-6">
+        <ErrorBoundary>
+          <h1 className="text-3xl font-bold mb-4 text-center text-gray-800 dark:text-gray-100">
+            {t('appName')}
+          </h1>
           {user ? (
             <div>
               <div className="flex items-center justify-between mb-4 border-b pb-4 dark:border-gray-700">
                 <div className="text-sm text-gray-600 dark:text-gray-300">
-                  Logged in as: <span className="font-semibold">{user.email}</span>
+                  {t('loggedInAs')} <span className="font-semibold">{user.email}</span>
                 </div>
                 <div className="flex items-center gap-2">
+                  <LanguageSelector />
                   <ThemeToggleButton />
-                  <button
-                    onClick={signOutUser}
-                    className="px-4 py-2 text-sm bg-red-500 text-white rounded-md shadow-md hover:bg-red-600 transition-colors"
-                  >
-                    Sign out
+                  <button onClick={signOutUser} className="px-4 py-2 text-sm bg-red-500 text-white rounded-md shadow-md hover:bg-red-600 transition-colors">
+                    {t('signOut')}
                   </button>
                 </div>
               </div>
@@ -697,19 +937,20 @@ function App() {
             </div>
           ) : (
             <div className="flex flex-col items-center text-center py-16">
-              <h2 className="text-xl font-semibold mb-2 text-gray-700 dark:text-gray-200">Welcome to the AI-Powered Chat Experience</h2>
-              <p className="mb-6 text-gray-500 dark:text-gray-400">Sign in to begin your conversation.</p>
-              <button
-                onClick={signInWithGoogle}
-                className="px-6 py-3 text-lg bg-blue-500 text-white rounded-md shadow-md hover:bg-blue-600 transition-colors flex items-center gap-2"
-              >
-                Sign in with Google
+              <h2 className="text-xl font-semibold mb-2 text-gray-700 dark:text-gray-200">
+                {t('welcomeTitle')}
+              </h2>
+              <p className="mb-6 text-gray-500 dark:text-gray-400">
+                {t('welcomeSubtitle')}
+              </p>
+              <button onClick={signInWithGoogle} className="px-6 py-3 text-lg bg-blue-500 text-white rounded-md shadow-md hover:bg-blue-600 transition-colors flex items-center gap-2">
+                {t('signInWithGoogle')}
               </button>
             </div>
           )}
-        </div>
+        </ErrorBoundary>
       </div>
-    </ThemeProvider>
+    </div>
   );
 }
 
