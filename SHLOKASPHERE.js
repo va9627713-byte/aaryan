@@ -57,11 +57,11 @@ async function sendMessageToFirestore(messageObj) {
 }
 
 // --- API Service Setup ---
-const API_BASE_URL = process.env.REACT_APP_API_URL || "http://localhost:5000";
+// For Vercel deployment, API calls are made to relative paths that point to Serverless Functions.
 
 const analyzeSentiment = async (text) => {
   try {
-    const response = await fetch(`${API_BASE_URL}/api/google-sentiment`, {
+    const response = await fetch(`/api/google-sentiment`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ text }),
@@ -77,7 +77,7 @@ const analyzeSentiment = async (text) => {
 
 const analyzeEntities = async (text) => {
   try {
-    const response = await fetch(`${API_BASE_URL}/api/google-entities`, {
+    const response = await fetch(`/api/google-entities`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ text }),
@@ -93,7 +93,7 @@ const analyzeEntities = async (text) => {
 
 const translateText = async (text, target) => {
   try {
-    const response = await fetch(`${API_BASE_URL}/api/google-translate`, {
+    const response = await fetch(`/api/google-translate`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ text, target }),
@@ -107,32 +107,20 @@ const translateText = async (text, target) => {
   }
 };
 
-const generatePlaceholderAIResponse = (message, history) => {
-    const lowerCaseMessage = message.toLowerCase();
-    if (lowerCaseMessage.includes("hello") || lowerCaseMessage.includes("hi")) {
-      return "Hello there! How can I assist you with the wisdom of the ages today?";
-    }
-    if (lowerCaseMessage.includes("help")) {
-      return "Of course. I can provide insights from our conversation, summarize text, or even translate for you. What do you need help with?";
-    }
-    if (lowerCaseMessage.includes("summarize")) {
-        const textToSummarize = history.map(m => m.text).join('\n');
-        return `Based on our conversation, here is a summary: [AI would summarize the text here. This is a great feature for a hackathon!]\n\nOur conversation has included ${history.length} messages so far.`;
-    }
-    return `Your words, "${message}", resonate with the cosmos. I am processing their meaning to provide you with a worthy response...`;
-};
-
 const getAIResponse = async (message, history) => {
-    try {
-        return new Promise(resolve => {
-            setTimeout(() => {
-                resolve(generatePlaceholderAIResponse(message, history));
-            }, 1500);
-        });
-    } catch(err) {
-        console.error("AI API call failed:", err);
-        return "I'm sorry, I'm having trouble connecting right now.";
-    }
+  try {
+    const response = await fetch(`/api/generate-response`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ message, history }),
+    });
+    if (!response.ok) throw new Error("AI response API error");
+    const data = await response.json();
+    return data.text;
+  } catch (err) {
+    console.error("AI API call failed:", err);
+    return "I'm sorry, I'm having trouble connecting right now.";
+  }
 };
 
 // --- Theme Management ---
@@ -278,11 +266,14 @@ function useMessages(user) {
   useEffect(() => {
     if (!user) return;
 
+    let isMounted = true;
+
     const loadInitialMessages = async () => {
       dispatch({ type: actionTypes.SET_LOADING, payload: true });
       try {
         const q = query(collection(db, "messages"), orderBy("timestamp", "desc"), limit(20));
         const snapshot = await getDocs(q);
+        if (!isMounted) return; // Prevent state update if component unmounted
         const initialMessages = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data(), timestamp: doc.data().timestamp?.toDate() })).reverse();
         dispatch({
           type: actionTypes.INITIAL_LOAD,
@@ -296,7 +287,9 @@ function useMessages(user) {
         console.error("Error loading initial messages:", error);
         toast.error("Could not load chat history.");
       } finally {
-        dispatch({ type: actionTypes.SET_LOADING, payload: false });
+        if (isMounted) {
+          dispatch({ type: actionTypes.SET_LOADING, payload: false });
+        }
       }
     };
 
@@ -315,7 +308,10 @@ function useMessages(user) {
       });
     });
 
-    return () => unsubscribe();
+    return () => {
+      isMounted = false;
+      unsubscribe();
+    };
   }, [user]);
 
   const loadMore = useCallback(async () => {
@@ -409,7 +405,8 @@ function useMessages(user) {
 
     const fetchAIResponse = async () => {
       try {
-        const responseText = await getAIResponse(messageText, messagesRef.current);
+        const currentHistory = [...messagesRef.current, optimisticMessage];
+        const responseText = await getAIResponse(messageText, currentHistory);
         const aiMessage = { user: user.email, text: responseText, sender: 'ai', timestamp: serverTimestamp(), tokens: responseText.split(/\s+/).length };
         await sendMessageToFirestore(aiMessage);
       } catch (error) {
@@ -436,13 +433,36 @@ function useMessages(user) {
 function AITypingIndicator() {
   return (
     <div className="flex my-2 gap-4 justify-start">
-      <div className="p-4 rounded-2xl shadow-md bg-gray-100">
-        <div className="flex items-center gap-2 text-gray-500">
-          <span className="h-2 w-2 bg-gray-400 rounded-full animate-bounce [animation-delay:-0.3s]"></span>
-          <span className="h-2 w-2 bg-gray-400 rounded-full animate-bounce [animation-delay:-0.15s]"></span>
-          <span className="h-2 w-2 bg-gray-400 rounded-full animate-bounce"></span>
+      <div className="p-4 rounded-2xl shadow-md bg-gray-100 dark:bg-gray-600">
+        <div className="flex items-center gap-2 text-gray-500 dark:text-gray-400">
+          <span className="h-2 w-2 bg-gray-400 dark:bg-gray-500 rounded-full animate-bounce [animation-delay:-0.3s]"></span>
+          <span className="h-2 w-2 bg-gray-400 dark:bg-gray-500 rounded-full animate-bounce [animation-delay:-0.15s]"></span>
+          <span className="h-2 w-2 bg-gray-400 dark:bg-gray-500 rounded-full animate-bounce"></span>
         </div>
       </div>
+    </div>
+  );
+}
+
+function MessageSkeleton({ sender = 'ai' }) {
+  const isUser = sender === 'user';
+  return (
+    <div className={`flex items-start gap-3 animate-pulse ${isUser ? 'flex-row-reverse ml-auto' : 'mr-auto'}`}>
+      <div className="h-8 w-8 rounded-full bg-gray-200 dark:bg-gray-600 flex-shrink-0"></div>
+      <div className="p-4 rounded-2xl bg-gray-200 dark:bg-gray-600 w-48">
+        <div className="h-4 bg-gray-300 dark:bg-gray-500 rounded w-5/6 mb-2"></div>
+        <div className="h-4 bg-gray-300 dark:bg-gray-500 rounded w-1/2"></div>
+      </div>
+    </div>
+  );
+}
+
+function AnalyticsSkeleton() {
+  return (
+    <div className="p-8 mt-8 bg-gray-50 dark:bg-gray-700/50 rounded-xl shadow-sm animate-pulse">
+      <div className="h-8 bg-gray-200 dark:bg-gray-600 rounded w-3/4 mb-6"></div>
+      <div className="h-6 bg-gray-200 dark:bg-gray-600 rounded w-1/2 mb-4"></div>
+      <div className="h-6 bg-gray-200 dark:bg-gray-600 rounded w-1/3"></div>
     </div>
   );
 }
@@ -469,10 +489,13 @@ const ThemeToggleButton = () => {
 
 const Avatar = ({ sender, userEmail }) => {
   const isUser = sender === 'user';
+  // Robustly get the first letter of the email, or 'U' as a fallback.
+  const nameInitial = (userEmail || 'U').charAt(0).toUpperCase();
   const avatarSrc = isUser
-    ? `https://ui-avatars.com/api/?name=${userEmail}&background=ffc107&color=fff&bold=true`
+    ? `https://ui-avatars.com/api/?name=${nameInitial}&background=ffc107&color=fff&bold=true`
     : `https://ui-avatars.com/api/?name=AI&background=4f46e5&color=fff&bold=true`;
 
+  // Eager loading for small, critical images like avatars provides a better user experience.
   return <img src={avatarSrc} alt={`${sender} avatar`} className="h-8 w-8 rounded-full shadow-md flex-shrink-0" />;
 };
 
@@ -551,6 +574,7 @@ const MessageItem = memo(function MessageItem({ message, performMessageAnalysis 
 function AnalyticsDashboard() {
   const [messageCount, setMessageCount] = useState(0);
   const [userCount, setUserCount] = useState(0);
+  const [loading, setLoading] = useState(true);
 
   useEffect(() => {
     const getStats = async () => {
@@ -561,10 +585,16 @@ function AnalyticsDashboard() {
         setUserCount(users.size);
       } catch (error) {
         console.error("Failed to get analytics data:", error);
+      } finally {
+        setLoading(false);
       }
     };
     getStats();
   }, []);
+
+  if (loading) {
+    return <AnalyticsSkeleton />;
+  }
 
   return (
     <div className="p-8 mt-8 bg-gray-50 dark:bg-gray-700/50 rounded-xl shadow-sm">
@@ -597,7 +627,11 @@ function ChatComponent({ user }) {
     <div className="mt-6">
       <div className="h-[60vh] overflow-y-auto p-4 border rounded-lg bg-gray-50 dark:bg-gray-900/50 dark:border-gray-700 space-y-4" role="log" aria-live="polite">
         {isLoading ? (
-          <div className="text-center text-gray-500 dark:text-gray-400">Loading messages...</div>
+          <div className="space-y-4">
+            <MessageSkeleton />
+            <MessageSkeleton sender="user" />
+            <MessageSkeleton />
+          </div>
         ) : (
           <>
             {hasMore && (
